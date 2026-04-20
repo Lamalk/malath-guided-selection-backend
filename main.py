@@ -1,14 +1,27 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
+from dotenv import load_dotenv
+from supabase import create_client, Client
+import os
+
+load_dotenv()
 
 app = FastAPI()
 
+# ================= Supabase =================
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+supabase: Client | None = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ================= Request Model =================
 class Answer(BaseModel):
     current_node: str
     selected_option: str
 
 # ================= Decision Tree =================
-
 decision_tree = {
     "start": {
         "question": "اختر نوع المشكلة:",
@@ -75,7 +88,7 @@ decision_tree = {
     },
 
     "blackmail_result": {
-        "message": "بعد تحليل إجاباتك، تم تصنيف الحالة كالتالي:\nابتزاز إلكتروني — يتضمن تهديد أو ضغط باستخدام معلومات أو محتوى شخصي."
+        "label": "ابتزاز إلكتروني"
     },
 
     # ================= اختراق حساب =================
@@ -94,7 +107,7 @@ decision_tree = {
     },
 
     "hack_result": {
-        "message": "تم تصنيف الحالة:\nاختراق حساب — دخول غير مصرح به أو فقدان السيطرة على الحساب."
+        "label": "اختراق حساب"
     },
 
     # ================= تهديد =================
@@ -113,7 +126,7 @@ decision_tree = {
     },
 
     "threat_result": {
-        "message": "تم تصنيف الحالة:\nتهديد إلكتروني — وجود تهديد أو تخويف عبر وسيلة رقمية."
+        "label": "تهديد إلكتروني"
     },
 
     # ================= احتيال =================
@@ -127,7 +140,7 @@ decision_tree = {
     },
 
     "fraud_result": {
-        "message": "تم تصنيف الحالة:\nاحتيال مالي — محاولة أو عملية خداع للحصول على أموال."
+        "label": "احتيال مالي"
     },
 
     # ================= سرقة بيانات =================
@@ -146,7 +159,7 @@ decision_tree = {
     },
 
     "data_result": {
-        "message": "تم تصنيف الحالة:\nسرقة بيانات — الوصول غير المصرح به إلى معلومات شخصية أو حساسة."
+        "label": "سرقة بيانات"
     },
 
     # ================= انتحال شخصية =================
@@ -160,7 +173,7 @@ decision_tree = {
     },
 
     "impersonation_result": {
-        "message": "تم تصنيف الحالة:\nانتحال شخصية — استخدام اسم أو بيانات شخص آخر بدون إذن."
+        "label": "انتحال شخصية"
     },
 
     # ================= أخرى =================
@@ -169,8 +182,203 @@ decision_tree = {
     }
 }
 
-# ================= API =================
+# ================= Mapping between app labels and DB names =================
+# بعض أسماء الجرائم في التطبيق مختصرة، بينما أسماء قاعدة البيانات أطول.
+# نحط احتمالات متعددة عشان البحث يكون مرن.
+LABEL_TO_CATEGORY_NAMES = {
+    "ابتزاز إلكتروني": [
+        "ابتزاز إلكتروني",
+        "نشر بيانات أو صور سرية بهدف الابتزاز",
+        "نشر الصور أو المقاطع الخاصة بدون إذن"
+    ],
+    "اختراق حساب": [
+        "اختراق حساب",
+        "دخول غير مشروع / اختراق حسابات",
+        "اختراق الأنظمة أو المواقع",
+        "تعطيل الخدمات أو إعاقة الوصول للأنظمة"
+    ],
+    "تهديد إلكتروني": [
+        "تهديد إلكتروني",
+        "تهديد إلكتروني",
+        "تحرش إلكتروني"
+    ],
+    "احتيال مالي": [
+        "احتيال مالي",
+        "احتيال مالي إلكتروني",
+        "سرقة البيانات البنكية أو بطاقات الدفع"
+    ],
+    "سرقة بيانات": [
+        "سرقة بيانات",
+        "إتلاف البيانات أو حذفها أو تعديلها",
+        "انتهاك الخصوصية"
+    ],
+    "انتحال شخصية": [
+        "انتحال شخصية",
+        "انتحال الهوية الرقمية",
+        "إنشاء أو استخدام حسابات مزيفة"
+    ]
+}
 
+# ================= Supabase Helpers =================
+def safe_table_select(table_name: str):
+    if not supabase:
+        return None
+    return supabase.table(table_name)
+
+def get_crime_category_by_label(label: str):
+    """
+    يحاول يجيب الجريمة من جدول crime_categories
+    باستخدام أكثر من اسم محتمل.
+    """
+    if not supabase:
+        return None
+
+    possible_names = LABEL_TO_CATEGORY_NAMES.get(label, [label])
+
+    for name in possible_names:
+        try:
+            response = (
+                supabase.table("crime_categories")
+                .select("*")
+                .eq("name", name)
+                .limit(1)
+                .execute()
+            )
+            if response.data:
+                return response.data[0]
+        except Exception:
+            pass
+
+    return None
+
+def get_legal_articles_for_category(category_id: int):
+    """
+    يجيب المواد القانونية المرتبطة بالجريمة عبر جدول الربط legal_article_categories
+    """
+    if not supabase:
+        return []
+
+    try:
+        link_response = (
+            supabase.table("legal_article_categories")
+            .select("legal_article_id")
+            .eq("crime_category_id", category_id)
+            .execute()
+        )
+
+        article_ids = [row["legal_article_id"] for row in link_response.data if row.get("legal_article_id") is not None]
+
+        if not article_ids:
+            return []
+
+        articles_response = (
+            supabase.table("legal_articles")
+            .select("id, article_number, article_title, article_content, penalty_details, reference_url")
+            .in_("id", article_ids)
+            .execute()
+        )
+
+        return articles_response.data or []
+
+    except Exception:
+        return []
+
+def get_reporting_methods_for_category(category_id: int):
+    """
+    يجيب طرق التبليغ المرتبطة بالجريمة عبر جدول الربط reporting_method_categories
+    """
+    if not supabase:
+        return []
+
+    try:
+        link_response = (
+            supabase.table("reporting_method_categories")
+            .select("reporting_method_id")
+            .eq("crime_category_id", category_id)
+            .execute()
+        )
+
+        method_ids = [row["reporting_method_id"] for row in link_response.data if row.get("reporting_method_id") is not None]
+
+        if not method_ids:
+            return []
+
+        methods_response = (
+            supabase.table("reporting_methods")
+            .select("id, method_name, authority_name, channel_type, description")
+            .in_("id", method_ids)
+            .execute()
+        )
+
+        return methods_response.data or []
+
+    except Exception:
+        return []
+
+def format_result_message(label: str) -> str:
+    """
+    يبني رسالة نهائية واحدة تُعرض مباشرة في نفس شاشة Guided Selection
+    بدون الحاجة لتعديل الواجهة.
+    """
+    base_message = f"بعد تحليل إجاباتك، تم تصنيف الحالة كالتالي:\n{label}"
+
+    if not supabase:
+        return base_message + "\n\nتعذر جلب البيانات المرتبطة لأن الاتصال بقاعدة البيانات غير متاح."
+
+    category = get_crime_category_by_label(label)
+
+    if not category:
+        return base_message + "\n\nلم يتم العثور على بيانات مرتبطة بهذه الجريمة في قاعدة البيانات."
+
+    category_id = category.get("id")
+    category_description = category.get("description", "")
+
+    articles = get_legal_articles_for_category(category_id)
+    reporting_methods = get_reporting_methods_for_category(category_id)
+
+    parts = [base_message]
+
+    if category_description:
+        parts.append(f"\nالوصف:\n{category_description}")
+
+    if articles:
+        article_texts = []
+        for article in articles[:3]:
+            article_number = article.get("article_number") or "بدون رقم"
+            article_title = article.get("article_title") or "بدون عنوان"
+            article_content = article.get("article_content") or "لا يوجد نص"
+            penalty_details = article.get("penalty_details") or "لا توجد تفاصيل عقوبة"
+
+            article_texts.append(
+                f"• {article_number} - {article_title}\n"
+                f"النص: {article_content}\n"
+                f"العقوبة: {penalty_details}"
+            )
+
+        parts.append("\nالمادة القانونية والعقوبة:\n" + "\n\n".join(article_texts))
+    else:
+        parts.append("\nالمادة القانونية والعقوبة:\nلا توجد مادة قانونية مرتبطة حاليًا.")
+
+    if reporting_methods:
+        reporting_texts = []
+        for method in reporting_methods[:5]:
+            method_name = method.get("method_name") or "طريقة تبليغ"
+            authority_name = method.get("authority_name") or "جهة غير محددة"
+            channel_type = method.get("channel_type") or "غير محدد"
+            description = method.get("description") or ""
+
+            text = f"• {method_name} - {authority_name} ({channel_type})"
+            if description:
+                text += f"\n{description}"
+            reporting_texts.append(text)
+
+        parts.append("\nخطوات التبليغ:\n" + "\n\n".join(reporting_texts))
+    else:
+        parts.append("\nخطوات التبليغ:\nلا توجد طرق تبليغ مرتبطة حاليًا.")
+
+    return "\n".join(parts)
+
+# ================= API =================
 @app.get("/start")
 def start():
     return {
@@ -191,6 +399,15 @@ def next_step(answer: Answer):
         return {"error": "invalid option"}
 
     next_node = decision_tree[next_node_key]
+
+    if "label" in next_node:
+        label = next_node["label"]
+        final_message = format_result_message(label)
+
+        return {
+            "node_id": next_node_key,
+            "message": final_message
+        }
 
     if "message" in next_node:
         return {
